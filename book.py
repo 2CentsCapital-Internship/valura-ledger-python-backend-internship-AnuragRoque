@@ -262,6 +262,97 @@ class State:
         return [leg("1100", cid, debit=amount),
                 leg("2010", cid, credit=amount)]
 
+    # -- cash events (Phase 1) ---------------------------------------------
+    def on_fee_charged(self, p: dict, ev: dict) -> list[dict]:
+        """The customer pays the firm's fee from their wallet; cash leaves the
+        omnibus account.  Dr 2010 / Cr 1100.
+        """
+        cid = p["customer_id"]
+        amount = money(p["amount"])
+        # remember it so a later fee_refund can look the amount up by id
+        self.fees[ev["event_id"]] = {"customer_id": cid, "amount": amount}
+        return [leg("2010", cid, debit=amount), leg("1100", cid, credit=amount)]
+
+    def on_fee_refund(self, p: dict, ev: dict) -> list[dict]:
+        """Undo an earlier fee in full. The amount is not in this payload -- it is
+        the amount of the fee_charged named by refunds_source_id. Refunding the
+        same fee twice is an error.  Dr 1100 / Cr 2010.
+        """
+        src = p["refunds_source_id"]
+        fee = self.fees.get(src)
+        if fee is None:
+            raise Rejected("refund of a fee never seen")
+        if src in self.refunded:
+            raise Rejected("fee already refunded")
+        self.refunded.add(src)
+        cid = fee["customer_id"]          # the customer the fee concerned
+        return [leg("1100", cid, debit=fee["amount"]),
+                leg("2010", cid, credit=fee["amount"])]
+
+    def on_withdrawal_requested(self, p: dict, ev: dict) -> list[dict]:
+        """Money has left the wallet but not the broker -- a different obligation.
+        Dr 2010 / Cr 2300.
+        """
+        wid = p["withdrawal_id"]
+        if wid in self.withdrawals:
+            raise Rejected("duplicate withdrawal id")
+        cid = p["customer_id"]
+        amount = money(p["amount"])
+        self.withdrawals[wid] = {"customer_id": cid, "amount": amount,
+                                 "status": "requested"}
+        return [leg("2010", cid, debit=amount), leg("2300", cid, credit=amount)]
+
+    def on_withdrawal_settled(self, p: dict, ev: dict) -> list[dict]:
+        """The cash actually leaves; look the amount up from the request.
+        Dr 2300 / Cr 1100.
+        """
+        w = self._open_withdrawal(p["withdrawal_id"])
+        w["status"] = "settled"
+        return [leg("2300", w["customer_id"], debit=w["amount"]),
+                leg("1100", w["customer_id"], credit=w["amount"])]
+
+    def on_withdrawal_rejected(self, p: dict, ev: dict) -> list[dict]:
+        """The withdrawal fails; the money is owed to the wallet again. No cash
+        ever moved.  Dr 2300 / Cr 2010.
+        """
+        w = self._open_withdrawal(p["withdrawal_id"])
+        w["status"] = "rejected"
+        return [leg("2300", w["customer_id"], debit=w["amount"]),
+                leg("2010", w["customer_id"], credit=w["amount"])]
+
+    def _open_withdrawal(self, wid: str) -> dict:
+        w = self.withdrawals.get(wid)
+        # No amount without the request; an unknown/closed id is refused. [reject
+        # vs hold-pending for out-of-order settles -- confirm on practice, §14.]
+        if w is None or w["status"] != "requested":
+            raise Rejected("settle/reject of an unknown or non-open withdrawal")
+        return w
+
+    def on_interest_credited(self, p: dict, ev: dict) -> list[dict]:
+        """The broker pays interest on the omnibus balance; the customer gets
+        their share, the firm keeps the remainder as income (not a pass-through).
+        Dr 1100 gross / Cr 2010 share / Cr 4200 remainder.
+        """
+        cid = p["customer_id"]
+        gross = money(p["gross_amount"])
+        share = money(p["customer_share"])
+        if share > gross:
+            raise Rejected("customer share exceeds gross interest")   # bad data
+        return _nonzero([leg("1100", cid, debit=gross),
+                         leg("2010", cid, credit=share),
+                         leg("4200", cid, credit=gross - share)])
+
+    def on_transfer_between_customers(self, p: dict, ev: dict) -> list[dict]:
+        """One customer pays another; no external cash moves and the firm's total
+        obligation is unchanged -- only whose money it is changes. Both legs land
+        on 2010, so the account nets to zero and only the per-customer key sees it.
+        """
+        frm, to = p["from_customer_id"], p["to_customer_id"]
+        if frm == to:
+            raise Rejected("transfer to self")     # no-op move, likely the defect
+        amount = money(p["amount"])
+        return [leg("2010", frm, debit=amount), leg("2010", to, credit=amount)]
+
     # -- orders: placement, fills, holds (Phase 3) -------------------------
     def _order(self, oid: str, p: dict) -> dict:
         """Get an order, lazily creating a stub if a fill arrived before its
@@ -319,8 +410,13 @@ class State:
         return self._fill(p, ev, final=True)
 
     def _fill(self, p: dict, ev: dict, final: bool) -> list[dict]:
+        # Legs first: a sell can reject (oversell), and a rejected event must
+        # leave the book -- including the order lifecycle -- exactly as it was.
+        legs = self._buy_fill(p, ev) if p["side"] == "buy" else self._sell_fill(p, ev)
+
+        # Lifecycle, only after the fill posted: create/patch the order (a fill
+        # may arrive before its placement), advance it, and release the hold.
         o = self._order(p["order_id"], p)
-        # patch any detail the placement would have set, if it has not arrived
         for k in ("customer_id", "side", "symbol", "asset_class"):
             o[k] = o[k] or p.get(k)
         o["filled_qty"] += D(p["quantity"])
@@ -329,12 +425,7 @@ class State:
             o["remaining_hold"] = ZERO
         else:
             self._reprice_hold(o)
-
-        if p["side"] == "buy":
-            return self._buy_fill(p, ev)
-        # sells need FIFO cost relief -- Phase 4. Lifecycle above is already kept.
-        self.todo["order_filled(sell)"] += 1
-        return []
+        return legs
 
     def _buy_fill(self, p: dict, ev: dict) -> list[dict]:
         """Buy fill (authoritative template, notes2.txt section 4). Customer pays
@@ -363,6 +454,69 @@ class State:
         self.lots[key].append(lot)
         self.lot_undo[ev["event_id"]] = ("add_lot", key, lot)   # for reversal (P8)
         self.trades[p["trade_id"]] = {"side": "buy", "principal": P,
+                                      "customer_id": cid, "settled": False}
+        return legs
+
+    # -- FIFO lot book & sells (Phase 4 -- the biggest lever) --------------
+    def _fifo_consume(self, cid: str, sym: str, qty: Decimal):
+        """Relieve FIFO cost for a sale of ``qty`` shares, oldest lot first, to
+        the cent. Validates the full quantity is available *before* mutating, so
+        an oversell rejects with the lot book untouched.
+
+        Returns ``(relief, slices)`` where ``slices`` records what was taken from
+        each lot, for the reversal in Phase 8.
+        """
+        lots = self.lots.get((cid, sym))
+        available = sum((l.qty for l in lots), D(0)) if lots else D(0)
+        if qty > available:
+            raise Rejected("oversell")             # zero mutation on this path
+        relief = ZERO
+        slices = []                                # (qty_taken, cost_taken, emptied)
+        remaining = qty
+        while remaining > 0:
+            lot = lots[0]
+            take = lot.qty if lot.qty <= remaining else remaining
+            # Graded convention: round(total_cost * sold / lot_qty), off the
+            # lot's *total* cost -- never a cost-per-share, which disagrees by a
+            # cent. The remainder stays with the lot.
+            cost_take = money(lot.cost * take / lot.qty)
+            relief += cost_take
+            lot.qty -= take
+            lot.cost -= cost_take
+            remaining -= take
+            emptied = lot.qty == 0
+            slices.append((take, cost_take, emptied))
+            if emptied:
+                lots.pop(0)
+        return relief, slices
+
+    def _sell_fill(self, p: dict, ev: dict) -> list[dict]:
+        """Sell fill (derived -- see plan.md section 6). Proceeds are a receivable
+        (1150) owed by the broker until settlement; the customer is credited the
+        principal net of their charges; custody and the customer's claim shrink by
+        the FIFO *cost* of the shares sold, not their sale value. The firm's six
+        fee legs match a buy. Realised P/L is the residual of the legs, never posted.
+        """
+        cid = p["customer_id"]
+        P = money(p["principal"])
+        ch = charges(p["broker"], P, p["partner_rate"])
+        b, c, r = ch["b"], ch["c"], ch["r"]
+        bc, cc, ps = ch["bc"], ch["cc"], ch["ps"]
+        # cost relief validates the sale first, so an oversell rejects cleanly
+        k, slices = self._fifo_consume(cid, p["symbol"], D(p["quantity"]))
+        payable = BROKERS[p["broker"]]["payable"]
+        legs = _nonzero([
+            leg("1150", cid, debit=P),      leg("2010", cid, credit=P - b - c - r),
+            leg("2100", cid, debit=k),      leg("1200", cid, credit=k),
+            leg("5000", cid, debit=bc),     leg("4000", cid, credit=b),
+            leg("5010", cid, debit=cc),     leg("4010", cid, credit=c),
+            leg("5100", cid, debit=ps),     leg("2400", cid, credit=r),
+            leg(payable, cid, credit=bc),
+            leg("2420", cid, credit=cc),
+            leg("2430", cid, credit=ps),
+        ])
+        self.lot_undo[ev["event_id"]] = ("sell", (cid, p["symbol"]), slices)
+        self.trades[p["trade_id"]] = {"side": "sell", "principal": P,
                                       "customer_id": cid, "settled": False}
         return legs
 

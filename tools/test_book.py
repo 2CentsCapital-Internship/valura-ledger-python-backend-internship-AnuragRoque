@@ -142,15 +142,136 @@ def test_partial_fill_releases_proportional_hold_and_reports_route():
     assert snap["open_order_routes"] == {"O1": "BRK-B"}
 
 
-def test_sell_fill_deferred_to_phase4_not_crash():
+def _sell(st, oid="O1", cid="C1", sym="ACME", qty="100", price="60",
+          principal="6000.00", cls="equity", broker="BRK-A", rate="0.30",
+          tid="S1", final=True):
+    etype = "order_filled" if final else "order_partially_filled"
+    return st.apply(_ev("s_" + tid, etype, order_id=oid, customer_id=cid,
+                        side="sell", symbol=sym, quantity=D(qty), price=D(price),
+                        principal=D(principal), asset_class=cls, broker=broker,
+                        partner_rate=D(rate), trade_id=tid))
+
+
+def test_sell_fill_balances_fifo_cost_and_net_credit():
+    # Worked example C: buy 100 @ cost 5000, sell 100 P=6000 BRK-A rate 0.30.
     st = State()
-    legs = st.apply(_ev("f_s1", "order_filled", order_id="S1", customer_id="C1",
-                        side="sell", symbol="ACME", quantity=D("10"),
-                        price=D("60"), principal=D("600.00"), asset_class="equity",
-                        broker="BRK-A", partner_rate=D("0.30"), trade_id="S1"))
-    assert legs == []                          # no wrong legs posted
-    assert st.todo["order_filled(sell)"] == 1
-    assert st.orders["S1"]["closed"] is True   # lifecycle still advanced
+    _place_buy(st)
+    _fill(st)                                   # lot: qty 100, cost 5000.00
+    legs = _sell(st, oid="O2", tid="S1")
+    dr, cr = _bal(legs)
+    assert dr == cr == D("11009.19")
+    assert _amt(legs, "1150", "debit") == D("6000.00")     # receivable, not 2350
+    assert _amt(legs, "2010", "credit") == D("5980.80")    # P - b - c - r
+    assert _amt(legs, "2100", "debit") == D("5000.00")     # claim shrinks by cost k
+    assert _amt(legs, "1200", "credit") == D("5000.00")
+    assert st.lots.get(("C1", "ACME"), []) == []           # position fully closed
+    assert st.trades["S1"]["side"] == "sell"
+
+
+def test_fifo_partial_lot_relief_total_cost_based():
+    st = State()
+    _place_buy(st)
+    _fill(st)                                   # lot: qty 100, cost 5000.00
+    _sell(st, oid="O2", qty="40", principal="2400.00", tid="S1")
+    lots = st.lots[("C1", "ACME")]
+    # relief = round(5000 * 40/100) = 2000.00; remainder stays with the lot
+    assert len(lots) == 1 and lots[0].qty == D("60") and lots[0].cost == D("3000.00")
+    snap = st.snapshot()
+    assert snap["customers"]["C1"]["positions"]["ACME"] == {
+        "quantity": "60", "cost_basis": "3000.00"}
+
+
+def test_fifo_spans_multiple_lots_oldest_first():
+    st = State()
+    # two lots at different cost-per-share: (10 @ total 100), (10 @ total 300)
+    _fill(st, oid="Oa", sym="XYZ", qty="10", price="10", principal="100.00", tid="Ta")
+    _fill(st, oid="Ob", sym="XYZ", qty="10", price="30", principal="300.00", tid="Tb")
+    # sell 15: consume lot1 fully (100) + 5/10 of lot2 -> round(300*5/10)=150
+    legs = _sell(st, oid="Os", sym="XYZ", qty="15", price="40",
+                 principal="600.00", tid="Ts")
+    assert _amt(legs, "2100", "debit") == D("250.00")      # 100 + 150 = k
+    lots = st.lots[("C1", "XYZ")]
+    assert len(lots) == 1 and lots[0].qty == D("5") and lots[0].cost == D("150.00")
+
+
+def test_oversell_rejected_with_zero_mutation():
+    st = State()
+    _fill(st, oid="Ob", sym="ACME", qty="10", price="50", principal="500.00", tid="Tb")
+    before = [(l.qty, l.cost) for l in st.lots[("C1", "ACME")]]
+    legs = _sell(st, oid="Os", sym="ACME", qty="20", principal="1200.00", tid="Ts")
+    assert legs == []                                       # refused
+    after = [(l.qty, l.cost) for l in st.lots[("C1", "ACME")]]
+    assert before == after                                 # lot book untouched
+    assert "Ts" not in st.trades
+    assert "Os" not in st.orders                            # no lifecycle trace
+
+
+# -- Phase 1: cash events ----------------------------------------------------
+def test_fee_charged_then_refund_and_guards():
+    st = State()
+    st.apply(_ev("d1", "deposit", customer_id="C1", amount=D("100.00")))
+    fee = st.apply(_ev("fee1", "fee_charged", customer_id="C1", amount=D("5.00")))
+    assert _amt(fee, "2010", "debit") == D("5.00") and _amt(fee, "1100", "credit") == D("5.00")
+    ref = st.apply(_ev("r1", "fee_refund", refunds_source_id="fee1", customer_id="C1"))
+    assert _amt(ref, "1100", "debit") == D("5.00") and _amt(ref, "2010", "credit") == D("5.00")
+    # wallet back to the post-deposit 100.00
+    assert st.snapshot()["customers"]["C1"]["wallet_cash"] == "100.00"
+    # double refund and unknown reference both reject
+    assert st.apply(_ev("r2", "fee_refund", refunds_source_id="fee1", customer_id="C1")) == []
+    assert st.apply(_ev("r3", "fee_refund", refunds_source_id="nope", customer_id="C1")) == []
+
+
+def test_withdrawal_lifecycle():
+    st = State()
+    st.apply(_ev("d1", "deposit", customer_id="C1", amount=D("100.00")))
+    req = st.apply(_ev("w1", "withdrawal_requested", withdrawal_id="W1",
+                       customer_id="C1", amount=D("30.00")))
+    assert _amt(req, "2010", "debit") == D("30.00") and _amt(req, "2300", "credit") == D("30.00")
+    # settle looks the amount up from the request
+    sett = st.apply(_ev("w2", "withdrawal_settled", withdrawal_id="W1"))
+    assert _amt(sett, "2300", "debit") == D("30.00") and _amt(sett, "1100", "credit") == D("30.00")
+    # a second settle (already closed) and an unknown id both reject
+    assert st.apply(_ev("w3", "withdrawal_settled", withdrawal_id="W1")) == []
+    assert st.apply(_ev("w4", "withdrawal_rejected", withdrawal_id="ghost")) == []
+
+
+def test_withdrawal_rejected_returns_to_wallet():
+    st = State()
+    st.apply(_ev("w1", "withdrawal_requested", withdrawal_id="W1",
+                 customer_id="C1", amount=D("30.00")))
+    legs = st.apply(_ev("w2", "withdrawal_rejected", withdrawal_id="W1"))
+    assert _amt(legs, "2300", "debit") == D("30.00") and _amt(legs, "2010", "credit") == D("30.00")
+
+
+def test_interest_credited_split_and_guard():
+    st = State()
+    legs = st.apply(_ev("i1", "interest_credited", customer_id="C1",
+                        gross_amount=D("10.00"), customer_share=D("7.00")))
+    assert _amt(legs, "1100", "debit") == D("10.00")
+    assert _amt(legs, "2010", "credit") == D("7.00")
+    assert _amt(legs, "4200", "credit") == D("3.00")       # firm keeps the rest
+    # gross == share -> the zero 4200 leg is omitted
+    legs2 = st.apply(_ev("i2", "interest_credited", customer_id="C1",
+                         gross_amount=D("5.00"), customer_share=D("5.00")))
+    assert all(l["account"] != "4200" for l in legs2)
+    # share > gross is bad data -> rejected
+    assert st.apply(_ev("i3", "interest_credited", customer_id="C1",
+                        gross_amount=D("5.00"), customer_share=D("6.00"))) == []
+
+
+def test_transfer_between_customers_account_nets_zero():
+    st = State()
+    st.apply(_ev("d1", "deposit", customer_id="C1", amount=D("100.00")))
+    legs = st.apply(_ev("t1", "transfer_between_customers", from_customer_id="C1",
+                        to_customer_id="C2", amount=D("30.00")))
+    assert _amt(legs, "2010", "debit") == D("30.00") and _amt(legs, "2010", "credit") == D("30.00")
+    snap = st.snapshot()
+    assert snap["customers"]["C1"]["wallet_cash"] == "70.00"
+    assert snap["customers"]["C2"]["wallet_cash"] == "30.00"
+    assert snap["trial_balance"]["2010"] == "-100.00"      # account nets across customers
+    # transfer to self is refused
+    assert st.apply(_ev("t2", "transfer_between_customers", from_customer_id="C1",
+                        to_customer_id="C1", amount=D("10.00"))) == []
 
 
 def test_fill_before_placement_is_handled():
