@@ -70,6 +70,14 @@ def leg(account: str, customer_id: str, debit=ZERO, credit=ZERO) -> dict:
             "debit": str(money(debit)), "credit": str(money(credit))}
 
 
+def _nonzero(legs: list[dict]) -> list[dict]:
+    """Drop legs that are 0.00 on both sides. A zero leg carries no balance and
+    no information (a loss-making fill has a zero partner share, ~1/4 of fills);
+    omitting it is balance-safe. [verify on practice -- plan.md section 14.]
+    """
+    return [l for l in legs if l["debit"] != "0.00" or l["credit"] != "0.00"]
+
+
 # ---------------------------------------------------------------------------
 # Reference tables (the live set -- notes2.txt sections 2 and 4)
 # ---------------------------------------------------------------------------
@@ -114,6 +122,50 @@ BROKERS: dict[str, dict] = {
 }
 
 REG_BPS = 8  # regulatory fee, charged to the customer and owed onward
+
+
+# ---------------------------------------------------------------------------
+# The tariff engine (pure -- see plan.md section 5). Every component is rounded
+# to the cent on its own before use; the partner share is then rounded once
+# more, off the already-rounded pieces.
+# ---------------------------------------------------------------------------
+def charges(broker: str, principal, partner_rate) -> dict:
+    """The six per-fill amounts for a fill of ``principal`` at ``broker``.
+
+    ``b`` brokerage revenue (Cr 4000), ``c`` custody revenue (Cr 4010),
+    ``r`` regulatory owed onward (Cr 2400), ``bc`` broker cost (Dr 5000 / Cr
+    241x), ``cc`` custody cost (Dr 5010 / Cr 2420), ``ps`` partner share
+    (Dr 5100 / Cr 2430). Brokerage is floored at the min fee; broker cost carries
+    the flat ticket; the partner share is ``rate x max(0, revenue - cost)`` with
+    no clawback.
+    """
+    spec = BROKERS[broker]
+    P = D(principal)
+    b = max(bps(P, spec["brokerage"]), spec["min_fee"])   # floored at min fee
+    c = bps(P, spec["custody"])
+    r = bps(P, REG_BPS)
+    bc = bps(P, spec["broker_cost"]) + spec["ticket"]     # cost carries the ticket
+    cc = bps(P, spec["custody_cost"])
+    margin = (b + c) - (bc + cc)                          # revenue - cost
+    ps = money(D(partner_rate) * max(ZERO, margin))       # clamp at 0: no clawback
+    return {"b": b, "c": c, "r": r, "bc": bc, "cc": cc, "ps": ps}
+
+
+def route(asset_class: str, notional) -> str | None:
+    """The broker an open order routes to: the lowest total customer charge
+    (brokerage + custody) on ``notional``, among brokers trading that class,
+    ties broken on broker id ascending -- so there is always exactly one answer.
+    """
+    best: tuple[Decimal, str] | None = None
+    for bid in sorted(BROKERS):                            # ascending id = tie-break
+        spec = BROKERS[bid]
+        if asset_class not in spec["classes"]:
+            continue
+        charge = max(bps(notional, spec["brokerage"]), spec["min_fee"]) \
+            + bps(notional, spec["custody"])
+        if best is None or charge < best[0]:
+            best = (charge, bid)
+    return best[1] if best else None
 
 
 class Rejected(Exception):
@@ -210,17 +262,126 @@ class State:
         return [leg("1100", cid, debit=amount),
                 leg("2010", cid, credit=amount)]
 
-    # Everything else is unimplemented on purpose: with no handler it routes to
-    # ``todo`` and scores zero for that event without stopping the run. Handlers
-    # land phase by phase (see plan.md section 11).
+    # -- orders: placement, fills, holds (Phase 3) -------------------------
+    def _order(self, oid: str, p: dict) -> dict:
+        """Get an order, lazily creating a stub if a fill arrived before its
+        placement. Details are patched in whenever the placement shows up.
+        """
+        o = self.orders.get(oid)
+        if o is None:
+            o = {"customer_id": p.get("customer_id"), "side": p.get("side"),
+                 "symbol": p.get("symbol"), "asset_class": p.get("asset_class"),
+                 "qty": None, "limit_price": None, "est_charges": ZERO,
+                 "hold": ZERO, "remaining_hold": ZERO,
+                 "filled_qty": ZERO, "closed": False, "route": None}
+            self.orders[oid] = o
+        return o
+
+    def on_order_placed(self, p: dict, ev: dict) -> list[dict]:
+        """No legs. A placement moves no money -- it creates a hold (reported at
+        checkpoints, never posted) and fixes the route for this open order.
+        """
+        o = self._order(p["order_id"], p)
+        o["customer_id"] = p["customer_id"]
+        o["side"] = p["side"]
+        o["symbol"] = p["symbol"]
+        o["asset_class"] = p["asset_class"]
+        o["qty"] = D(p["quantity"])
+        o["limit_price"] = D(p["limit_price"])
+        o["est_charges"] = money(p["est_charges"])
+        notional = o["qty"] * o["limit_price"]
+        o["route"] = route(p["asset_class"], notional)
+        if p["side"] == "buy":
+            # buy hold = principal notional + the est_charges given in the feed
+            o["hold"] = money(notional + o["est_charges"])
+            self._reprice_hold(o)          # reconcile if fills arrived first
+        else:
+            o["hold"] = o["remaining_hold"] = ZERO   # sell hold is shares, not cash
+        return []
+
+    def _reprice_hold(self, o: dict) -> None:
+        """Remaining buy hold after the fills seen so far. A fill releases a
+        share of the hold proportional to filled quantity; a closed order holds
+        nothing.
+        """
+        if o["closed"] or o["side"] != "buy" or not o["qty"] or not o["hold"]:
+            return
+        if o["filled_qty"] >= o["qty"]:
+            o["remaining_hold"] = ZERO
+        else:
+            released = money(o["hold"] * o["filled_qty"] / o["qty"])
+            o["remaining_hold"] = o["hold"] - released
+
+    def on_order_partially_filled(self, p: dict, ev: dict) -> list[dict]:
+        return self._fill(p, ev, final=False)
+
+    def on_order_filled(self, p: dict, ev: dict) -> list[dict]:
+        return self._fill(p, ev, final=True)
+
+    def _fill(self, p: dict, ev: dict, final: bool) -> list[dict]:
+        o = self._order(p["order_id"], p)
+        # patch any detail the placement would have set, if it has not arrived
+        for k in ("customer_id", "side", "symbol", "asset_class"):
+            o[k] = o[k] or p.get(k)
+        o["filled_qty"] += D(p["quantity"])
+        if final:                          # last fill closes the order, hold -> 0
+            o["closed"] = True
+            o["remaining_hold"] = ZERO
+        else:
+            self._reprice_hold(o)
+
+        if p["side"] == "buy":
+            return self._buy_fill(p, ev)
+        # sells need FIFO cost relief -- Phase 4. Lifecycle above is already kept.
+        self.todo["order_filled(sell)"] += 1
+        return []
+
+    def _buy_fill(self, p: dict, ev: dict) -> list[dict]:
+        """Buy fill (authoritative template, notes2.txt section 4). Customer pays
+        principal + all charges; the firm accrues revenue/cost/reg/partner gross;
+        cash does not move (settles two days later).
+        """
+        cid = p["customer_id"]
+        P = money(p["principal"])
+        ch = charges(p["broker"], P, p["partner_rate"])
+        b, c, r = ch["b"], ch["c"], ch["r"]
+        bc, cc, ps = ch["bc"], ch["cc"], ch["ps"]
+        payable = BROKERS[p["broker"]]["payable"]
+        legs = _nonzero([
+            leg("2010", cid, debit=P + b + c + r), leg("2350", cid, credit=P),
+            leg("1200", cid, debit=P),             leg("2100", cid, credit=P),
+            leg("5000", cid, debit=bc),            leg("4000", cid, credit=b),
+            leg("5010", cid, debit=cc),            leg("4010", cid, credit=c),
+            leg("5100", cid, debit=ps),            leg("2400", cid, credit=r),
+            leg(payable, cid, credit=bc),
+            leg("2420", cid, credit=cc),
+            leg("2430", cid, credit=ps),
+        ])
+        # FIFO lot: cost basis is the principal only -- commission is the firm's.
+        key = (cid, p["symbol"])
+        lot = Lot(D(p["quantity"]), P)
+        self.lots[key].append(lot)
+        self.lot_undo[ev["event_id"]] = ("add_lot", key, lot)   # for reversal (P8)
+        self.trades[p["trade_id"]] = {"side": "buy", "principal": P,
+                                      "customer_id": cid, "settled": False}
+        return legs
+
+    def on_order_cancelled(self, p: dict, ev: dict) -> list[dict]:
+        """No legs. Close the order and release whatever hold remains."""
+        o = self.orders.get(p["order_id"])
+        if o is not None:
+            o["closed"] = True
+            o["remaining_hold"] = ZERO
+        return []
+
+    def on_order_rejected(self, p: dict, ev: dict) -> list[dict]:
+        return self.on_order_cancelled(p, ev)
 
     # -- reporting ----------------------------------------------------------
     def snapshot(self) -> dict:
         """What a checkpoint_request wants: the whole state, debit-positive.
 
         Report every account ever posted to, including any netted back to zero.
-        (Positions, holds and routes fill in from Phase 3 on; here only deposits
-        have posted, so those stay empty.)
         """
         tb: dict[str, Decimal] = defaultdict(lambda: ZERO)
         for acct in self.posted_accounts:
@@ -229,11 +390,33 @@ class State:
             tb[acct] += bal
 
         customers: dict[str, dict] = {}
+
+        def cust(cid: str) -> dict:
+            return customers.setdefault(cid, {"wallet_cash": ZERO,
+                                              "cash_hold": ZERO, "positions": {}})
+
         for (cid, acct), bal in self.balances.items():
-            c = customers.setdefault(cid, {"wallet_cash": ZERO,
-                                           "cash_hold": ZERO, "positions": {}})
             if acct == "2010":
-                c["wallet_cash"] += -bal        # a liability, so credit-positive
+                cust(cid)["wallet_cash"] += -bal    # a liability, credit-positive
+
+        # positions from the lot book: quantity as a plain string, cost basis as
+        # the sum of lot total costs. Omit anything that has netted to zero qty.
+        for (cid, sym), lots in self.lots.items():
+            q = sum((l.qty for l in lots), D(0))
+            if q == 0:
+                continue
+            cost = sum((l.cost for l in lots), ZERO)
+            cust(cid)["positions"][sym] = {"quantity": qty_str(q),
+                                           "cost_basis": str(money(cost))}
+
+        # cash_hold = remaining buy holds of a customer's still-open orders
+        # (sell holds are shares, not cash).
+        for o in self.orders.values():
+            if not o["closed"] and o["side"] == "buy" and o["remaining_hold"] > 0:
+                cust(o["customer_id"])["cash_hold"] += o["remaining_hold"]
+
+        open_routes = {oid: o["route"] for oid, o in self.orders.items()
+                       if not o["closed"] and o["route"]}
 
         return {
             "trial_balance": {a: str(money(v)) for a, v in sorted(tb.items())},
@@ -241,6 +424,7 @@ class State:
                                 "cash_hold": str(money(c["cash_hold"])),
                                 "positions": c["positions"]}
                           for cid, c in sorted(customers.items())},
+            "open_order_routes": dict(sorted(open_routes.items())),
         }
 
 
