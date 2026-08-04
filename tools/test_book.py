@@ -291,6 +291,245 @@ def test_cancel_releases_hold_no_legs():
     assert st.snapshot()["open_order_routes"] == {}
 
 
+# -- Phase 5: trade settlement -----------------------------------------------
+def test_trade_settled_buy_then_sell():
+    st = State()
+    _place_buy(st)
+    _fill(st)                                   # buy trade T1, principal 5000
+    legs = st.apply(_ev("ts1", "trade_settled", trade_id="T1"))
+    assert _amt(legs, "2350", "debit") == D("5000.00")     # obligation discharged
+    assert _amt(legs, "1100", "credit") == D("5000.00")    # cash finally leaves
+    assert st.balances[("C1", "2350")] == D("0.00")
+    _sell(st, oid="O2", tid="S1")                          # sell trade S1, P 6000
+    legs2 = st.apply(_ev("ts2", "trade_settled", trade_id="S1"))
+    assert _amt(legs2, "1100", "debit") == D("6000.00")    # cash arrives
+    assert _amt(legs2, "1150", "credit") == D("6000.00")   # receivable cleared
+    assert st.balances[("C1", "1150")] == D("0.00")
+    assert st.trades["S1"]["settled"] is True
+
+
+def test_trade_settled_unknown_and_double_reject():
+    st = State()
+    _place_buy(st)
+    _fill(st)
+    assert st.apply(_ev("tsx", "trade_settled", trade_id="NOPE")) == []
+    st.apply(_ev("ts1", "trade_settled", trade_id="T1"))
+    assert st.apply(_ev("ts2", "trade_settled", trade_id="T1")) == []   # already done
+
+
+# -- Phase 6: as-of checkpoints ----------------------------------------------
+def test_asof_checkpoint_reflects_history_not_current():
+    from book import Book
+    b = Book(dump=None)
+    b.apply(_ev("d1", "deposit", customer_id="C1", amount=D("100.00")))
+    b.apply(_ev("p1", "order_placed", order_id="O1", customer_id="C1", side="buy",
+                symbol="ACME", quantity=D("10"), limit_price=D("10"),
+                asset_class="equity", est_charges=D("2.00")))
+    b.apply(_ev("f1", "order_filled", order_id="O1", customer_id="C1", side="buy",
+                symbol="ACME", quantity=D("10"), price=D("10"),
+                principal=D("100.00"), asset_class="equity", broker="BRK-A",
+                partner_rate=D("0.30"), trade_id="T1"))
+    # as-of the deposit: no position and no order yet
+    early = b.snapshot(as_of="d1")
+    assert early["customers"]["C1"]["positions"] == {}
+    assert early["open_order_routes"] == {}
+    # as-of the placement: order open, hold reported, still no position.
+    # notional 100 -> min-fee floors dominate, so BRK-A (1.04) beats BRK-B (2.55).
+    placed = b.snapshot(as_of="p1")
+    assert placed["open_order_routes"] == {"O1": "BRK-A"}
+    assert placed["customers"]["C1"]["cash_hold"] == "102.00"
+    # current: filled -> position exists, order closed, hold released
+    cur = b.snapshot()
+    assert cur["customers"]["C1"]["positions"]["ACME"]["quantity"] == "10"
+    assert cur["open_order_routes"] == {}
+
+
+# -- Phase 7: corporate actions ----------------------------------------------
+def test_dividend_cash_net_only():
+    st = State()
+    legs = st.apply(_ev("dv1", "dividend_cash", customer_id="C1", symbol="ACME",
+                        gross_amount=D("100.00"), withholding_tax=D("15.00"),
+                        net_amount=D("85.00")))
+    assert _amt(legs, "1100", "debit") == D("85.00")
+    assert _amt(legs, "2010", "credit") == D("85.00")       # no tax payable leg
+
+
+def test_dividend_reinvested_adds_lot_no_cash():
+    st = State()
+    legs = st.apply(_ev("dv2", "dividend_reinvested", customer_id="C1", symbol="ACME",
+                        gross_amount=D("100.00"), withholding_tax=D("15.00"),
+                        net_amount=D("85.00"), reinvest_price=D("8.50"),
+                        reinvest_quantity=D("10")))
+    assert _amt(legs, "1200", "debit") == D("85.00")
+    assert _amt(legs, "2100", "credit") == D("85.00")       # cash never involved
+    lots = st.lots[("C1", "ACME")]
+    assert lots[0].qty == D("10") and lots[0].cost == D("85.00")
+
+
+def test_stock_split_scales_qty_keeps_total_cost():
+    st = State()
+    _place_buy(st)
+    _fill(st)                                    # lot 100 @ cost 5000.00
+    legs = st.apply(_ev("sp1", "stock_split", customer_id="C1", symbol="ACME",
+                        ratio_from=D("1"), ratio_to=D("2")))    # 2-for-1
+    assert legs == []
+    snap = st.snapshot()["customers"]["C1"]["positions"]["ACME"]
+    assert snap == {"quantity": "200", "cost_basis": "5000.00"}  # cost unchanged
+
+
+def test_symbol_change_rekeys_and_preserves_cost():
+    st = State()
+    _place_buy(st)
+    _fill(st)                                    # ACME lot 100 @ 5000
+    st.apply(_ev("sc1", "symbol_change", customer_id="C1",
+                 old_symbol="ACME", new_symbol="BCME"))
+    pos = st.snapshot()["customers"]["C1"]["positions"]
+    assert "ACME" not in pos
+    assert pos["BCME"] == {"quantity": "100", "cost_basis": "5000.00"}
+
+
+def test_symbol_change_into_occupied_merges_fifo():
+    st = State()
+    # buy BCME first (older, seq 1), then ACME (newer, seq 2)
+    _fill(st, oid="Ob", sym="BCME", qty="10", price="10", principal="100.00", tid="Tb")
+    _fill(st, oid="Oa", sym="ACME", qty="10", price="50", principal="500.00", tid="Ta")
+    st.apply(_ev("sc1", "symbol_change", customer_id="C1",
+                 old_symbol="ACME", new_symbol="BCME"))     # merge into BCME
+    # sell 10: FIFO must take the older BCME lot (cost 100) first, not ACME's 500
+    legs = _sell(st, oid="Os", sym="BCME", qty="10", price="20",
+                 principal="200.00", tid="Ts")
+    assert _amt(legs, "2100", "debit") == D("100.00")       # oldest lot relieved
+
+
+# -- Phase 8: reversals ------------------------------------------------------
+def test_reversal_of_buy_inverts_legs_and_removes_lot():
+    st = State()
+    _place_buy(st)
+    _fill(st)                                    # buy event id "f_T1"
+    rev = st.apply(_ev("rev1", "reversal", reverses_event_id="f_T1", reason="oops"))
+    assert _amt(rev, "2010", "credit") == D("5016.00")      # inverse of Dr 2010
+    assert _amt(rev, "2350", "debit") == D("5000.00")       # inverse of Cr 2350
+    assert st.lots.get(("C1", "ACME"), []) == []            # lot removed
+    assert st.snapshot()["customers"]["C1"]["positions"] == {}   # as if never bought
+    assert money(sum(st.balances.values())) == D("0.00")
+
+
+def test_reversal_of_sell_restores_consumed_lot():
+    st = State()
+    _place_buy(st)
+    _fill(st)                                    # lot 100 @ 5000
+    _sell(st, oid="O2", qty="40", principal="2400.00", tid="S1")  # -> lot 60 @ 3000
+    st.apply(_ev("rev1", "reversal", reverses_event_id="s_S1"))
+    lots = st.lots[("C1", "ACME")]
+    assert sum(l.qty for l in lots) == D("100")
+    assert sum(l.cost for l in lots) == D("5000.00")        # cost fully restored
+
+
+def test_reversal_of_split_scales_back():
+    st = State()
+    _place_buy(st)
+    _fill(st)
+    st.apply(_ev("sp1", "stock_split", customer_id="C1", symbol="ACME",
+                 ratio_from=D("1"), ratio_to=D("2")))
+    st.apply(_ev("rev1", "reversal", reverses_event_id="sp1"))
+    lots = st.lots[("C1", "ACME")]
+    assert sum(l.qty for l in lots) == D("100") and sum(l.cost for l in lots) == D("5000.00")
+
+
+def test_reversal_unknown_ref_rejected():
+    st = State()
+    assert st.apply(_ev("revx", "reversal", reverses_event_id="ghost")) == []
+
+
+def test_reversal_of_fill_does_not_restore_hold():
+    st = State()
+    _place_buy(st)                               # hold 5020.00
+    _fill(st, qty="40", principal="2000.00", tid="T1", final=False)  # remaining 3012
+    st.apply(_ev("rev1", "reversal", reverses_event_id="f_T1"))
+    snap = st.snapshot()["customers"]["C1"]
+    assert snap["cash_hold"] == "3012.00"        # released hold stays released
+    assert snap["positions"] == {}               # but the lot is gone
+
+
+# -- Phase 9: fx_deposit -----------------------------------------------------
+def test_fx_deposit_spread_to_4100():
+    st = State()
+    legs = st.apply(_ev("fx1", "fx_deposit", customer_id="C1", amount_foreign=D("1000"),
+                        currency="EUR", market_rate=D("1.10"), customer_rate=D("1.08"),
+                        usd_at_market_rate=D("1100.00"), usd_at_customer_rate=D("1080.00")))
+    assert _amt(legs, "1100", "debit") == D("1100.00")
+    assert _amt(legs, "2010", "credit") == D("1080.00")
+    assert _amt(legs, "4100", "credit") == D("20.00")       # firm's FX spread
+
+
+def test_fx_deposit_negative_spread_rejected():
+    st = State()
+    assert st.apply(_ev("fx2", "fx_deposit", customer_id="C1", amount_foreign=D("1000"),
+                        currency="EUR", market_rate=D("1.08"), customer_rate=D("1.10"),
+                        usd_at_market_rate=D("1080.00"),
+                        usd_at_customer_rate=D("1100.00"))) == []
+
+
+# -- Phase 10: resilience & defect audit -------------------------------------
+def test_audit_flags_inconsistent_fills():
+    st = State()
+    # principal disagrees with qty*price
+    st.apply(_ev("f1", "order_filled", order_id="O1", customer_id="C1", side="buy",
+                 symbol="ACME", quantity=D("10"), price=D("50"), principal=D("999.00"),
+                 asset_class="equity", broker="BRK-A", partner_rate=D("0.30"), trade_id="T1"))
+    assert st.stats["audit:principal!=qty*price"] == 1
+    # BRK-A does not trade bonds
+    st.apply(_ev("f2", "order_filled", order_id="O2", customer_id="C1", side="buy",
+                 symbol="BND", quantity=D("10"), price=D("50"), principal=D("500.00"),
+                 asset_class="bond", broker="BRK-A", partner_rate=D("0.30"), trade_id="T2"))
+    assert st.stats["audit:broker!=asset_class"] == 1
+
+
+def test_nonstrict_never_stalls_but_strict_surfaces():
+    bad = _ev("f1", "order_filled", order_id="O1", customer_id="C1", side="buy",
+              symbol="ACME", quantity=D("10"), price=D("50"), principal=D("500.00"),
+              asset_class="equity", partner_rate=D("0.30"), trade_id="T1")  # no broker
+    lenient = State(strict=False)
+    assert lenient.apply(bad) == []                         # rejected, not raised
+    assert lenient.stats["error:order_filled"] == 1
+    raised = False
+    try:
+        State(strict=True).apply(dict(bad))
+    except Exception:
+        raised = True
+    assert raised                                           # our bug would surface
+
+
+def test_reconcile_clean_after_balanced_run():
+    st = State()
+    _place_buy(st)
+    _fill(st)
+    r = st.reconcile()
+    assert r["trial_balance_zero"] and not r["negative_positions"]
+    assert not r["negative_lot_cost"] and not r["negative_holds"]
+    assert r["unsettled_trades"] == 1                       # the buy trade pending
+
+
+def test_idempotent_across_forced_reset():
+    from book import Book
+    b = Book(dump=None)
+    evs = [
+        _ev("d1", "deposit", customer_id="C1", amount=D("1000.00")),
+        _ev("p1", "order_placed", order_id="O1", customer_id="C1", side="buy",
+            symbol="ACME", quantity=D("10"), limit_price=D("50"),
+            asset_class="equity", est_charges=D("5.00")),
+        _ev("f1", "order_filled", order_id="O1", customer_id="C1", side="buy",
+            symbol="ACME", quantity=D("10"), price=D("50"), principal=D("500.00"),
+            asset_class="equity", broker="BRK-A", partner_rate=D("0.30"), trade_id="T1"),
+    ]
+    for e in evs:
+        b.apply(e)
+    snap1 = b.snapshot()
+    for e in evs:                                            # server re-delivers them
+        b.apply(e)
+    assert b.snapshot() == snap1                             # byte-identical
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

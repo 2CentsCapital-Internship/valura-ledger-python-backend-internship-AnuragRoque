@@ -55,6 +55,13 @@ def bps(principal, n) -> Decimal:
     return money(D(principal) * D(n) / D(10000))
 
 
+def qty6(q) -> Decimal:
+    """A share quantity to 6 dp, half away from zero. Splits can produce a
+    non-terminating ratio; quantities are graded to at most 6 dp.
+    """
+    return D(q).quantize(D("0.000001"), rounding=ROUND_HALF_UP)
+
+
 def qty_str(q) -> str:
     """A share quantity as a plain decimal string: ``"8"``, never ``"8.000000"``
     and never ``"1E+1"``.
@@ -181,20 +188,23 @@ class Lot:
     """A FIFO purchase parcel: a total cost against a quantity.
 
     The graded FIFO formula relieves ``round(cost * sold / qty)`` from the total,
-    so we carry the *total* cost, never a cost-per-share.
+    so we carry the *total* cost, never a cost-per-share. ``seq`` is the delivery
+    order the lot was created in, so FIFO survives a rename that merges two
+    symbols' lots into one book.
     """
-    __slots__ = ("qty", "cost")
+    __slots__ = ("qty", "cost", "seq")
 
-    def __init__(self, qty: Decimal, cost: Decimal) -> None:
+    def __init__(self, qty: Decimal, cost: Decimal, seq: int = 0) -> None:
         self.qty = D(qty)
         self.cost = D(cost)
+        self.seq = seq
 
 
 # ---------------------------------------------------------------------------
 # State: the whole ledger, and the one place events are interpreted.
 # ---------------------------------------------------------------------------
 class State:
-    def __init__(self) -> None:
+    def __init__(self, strict: bool = True) -> None:
         # balances[(customer_id, account)] = debit-positive balance
         self.balances: dict[tuple[str, str], Decimal] = defaultdict(lambda: ZERO)
         self.lots: dict[tuple[str, str], list[Lot]] = defaultdict(list)
@@ -209,6 +219,14 @@ class State:
         self.posted_accounts: set[str] = set()     # every account ever touched
         self.todo: dict[str, int] = defaultdict(int)  # unhandled types (skeleton)
         self.stats: Counter = Counter()            # per-type / per-outcome tallies
+        self._seq = 0                              # monotonic lot delivery counter
+        # strict surfaces our own bugs (tests, offline replay); the live Book
+        # runs non-strict so an unexpected fault becomes a reject, never a stall.
+        self.strict = strict
+
+    def _new_lot(self, qty, cost) -> Lot:
+        self._seq += 1
+        return Lot(qty, cost, self._seq)
 
     # -- the pure entry point ----------------------------------------------
     def apply(self, ev: dict) -> list[dict]:
@@ -221,6 +239,7 @@ class State:
         """
         etype = ev["type"]
         self.stats[etype] += 1
+        self._audit(etype, ev.get("payload") or {})   # defect-hunt telemetry
         handler = getattr(self, "on_" + etype, None)
         if handler is None:
             self.todo[etype] += 1
@@ -231,9 +250,13 @@ class State:
         except Rejected:
             self.stats["reject:" + etype] += 1
             return []
-        except (KeyError, ValueError, ArithmeticError, TypeError):
-            # A payload that will not parse is bad data: refuse it, carry on.
-            self.stats["malformed:" + etype] += 1
+        except Exception:
+            # Never stall the run: a malformed payload or an unexpected fault
+            # becomes a rejected event. In strict mode (tests, offline replay)
+            # it surfaces instead, so our own bugs are never masked.
+            if self.strict:
+                raise
+            self.stats["error:" + etype] += 1
             return []
         self.legs_by_id[ev["event_id"]] = legs
         self.stats["posted:" + etype] += 1
@@ -450,7 +473,7 @@ class State:
         ])
         # FIFO lot: cost basis is the principal only -- commission is the firm's.
         key = (cid, p["symbol"])
-        lot = Lot(D(p["quantity"]), P)
+        lot = self._new_lot(D(p["quantity"]), P)
         self.lots[key].append(lot)
         self.lot_undo[ev["event_id"]] = ("add_lot", key, lot)   # for reversal (P8)
         self.trades[p["trade_id"]] = {"side": "buy", "principal": P,
@@ -481,11 +504,12 @@ class State:
             # cent. The remainder stays with the lot.
             cost_take = money(lot.cost * take / lot.qty)
             relief += cost_take
+            seq = lot.seq
             lot.qty -= take
             lot.cost -= cost_take
             remaining -= take
             emptied = lot.qty == 0
-            slices.append((take, cost_take, emptied))
+            slices.append((seq, take, cost_take, emptied))   # seq: exact restore
             if emptied:
                 lots.pop(0)
         return relief, slices
@@ -530,6 +554,218 @@ class State:
 
     def on_order_rejected(self, p: dict, ev: dict) -> list[dict]:
         return self.on_order_cancelled(p, ev)
+
+    # -- settlement (Phase 5) ----------------------------------------------
+    def on_trade_settled(self, p: dict, ev: dict) -> list[dict]:
+        """Settlement day: the cash from that fill actually moves, discharging the
+        obligation the fill created. Nothing else about the trade changes.
+        Buy: Dr 2350 / Cr 1100.  Sell: Dr 1100 / Cr 1150.
+        """
+        t = self.trades.get(p["trade_id"])
+        if t is None:
+            # No side or principal without the fill. [reject vs hold-pending for
+            # an out-of-order settle -- confirm on practice, plan.md section 14.]
+            raise Rejected("settlement of an unknown trade")
+        if t["settled"]:
+            raise Rejected("trade already settled")
+        t["settled"] = True
+        cid, P = t["customer_id"], t["principal"]
+        if t["side"] == "buy":
+            return [leg("2350", cid, debit=P), leg("1100", cid, credit=P)]
+        return [leg("1100", cid, debit=P), leg("1150", cid, credit=P)]
+
+    # -- corporate actions, per named customer only (Phase 7) --------------
+    def on_dividend_cash(self, p: dict, ev: dict) -> list[dict]:
+        """Tax was withheld at source, so only the net ever reaches the firm and
+        it owes the tax to nobody. The net is the customer's money.
+        Dr 1100 net / Cr 2010 net.
+        """
+        cid = p["customer_id"]
+        net = money(p["net_amount"])
+        return [leg("1100", cid, debit=net), leg("2010", cid, credit=net)]
+
+    def on_dividend_reinvested(self, p: dict, ev: dict) -> list[dict]:
+        """The broker reinvests the net directly; cash is never involved. The
+        holding grows by a new lot of reinvest_quantity whose cost is the net.
+        Dr 1200 net / Cr 2100 net.
+        """
+        cid, sym = p["customer_id"], p["symbol"]
+        net = money(p["net_amount"])
+        key = (cid, sym)
+        lot = self._new_lot(D(p["reinvest_quantity"]), net)
+        self.lots[key].append(lot)
+        self.lot_undo[ev["event_id"]] = ("add_lot", key, lot)
+        return [leg("1200", cid, debit=net), leg("2100", cid, credit=net)]
+
+    def on_stock_split(self, p: dict, ev: dict) -> list[dict]:
+        """No legs. Quantity scales by ratio_to / ratio_from; the total cost of
+        each lot is unchanged (cost per share moves).
+        """
+        cid, sym = p["customer_id"], p["symbol"]
+        rf, rt = D(p["ratio_from"]), D(p["ratio_to"])
+        lots = self.lots.get((cid, sym))
+        if not lots:
+            raise Rejected("split of a symbol not held")   # confirm on practice §14
+        for l in lots:
+            l.qty = qty6(l.qty * rt / rf)                  # cost stays put
+        self.lot_undo[ev["event_id"]] = ("split", (cid, sym), rf, rt)
+        return []
+
+    def on_symbol_change(self, p: dict, ev: dict) -> list[dict]:
+        """No legs. Re-key the holding old_symbol -> new_symbol. A rename into an
+        occupied symbol merges the lots, kept in FIFO delivery order by seq.
+        """
+        cid = p["customer_id"]
+        old_key, new_key = (cid, p["old_symbol"]), (cid, p["new_symbol"])
+        moving = self.lots.get(old_key)
+        if not moving:
+            raise Rejected("rename of a symbol not held")  # confirm on practice §14
+        existing = self.lots.get(new_key, [])
+        self.lot_undo[ev["event_id"]] = ("rename", cid, p["old_symbol"],
+                                         p["new_symbol"], list(moving))
+        self.lots[new_key] = sorted(existing + moving, key=lambda l: l.seq)
+        self.lots.pop(old_key, None)
+        return []
+
+    # -- foreign currency (Phase 9) ----------------------------------------
+    def on_fx_deposit(self, p: dict, ev: dict) -> list[dict]:
+        """Money arrives in another currency and is converted. The omnibus account
+        receives the market value; the customer is credited at their (worse) rate;
+        the gap is the firm's FX spread, earned now.
+        Dr 1100 usd_at_market_rate / Cr 2010 usd_at_customer_rate / Cr 4100 spread.
+        A customer rate better than market is a negative spread -- bad data, refused.
+        """
+        cid = p["customer_id"]
+        if D(p["customer_rate"]) > D(p["market_rate"]):
+            raise Rejected("fx negative spread: customer rate better than market")
+        market = money(p["usd_at_market_rate"])
+        customer = money(p["usd_at_customer_rate"])
+        spread = market - customer
+        if spread < ZERO:
+            raise Rejected("fx negative spread")
+        return _nonzero([leg("1100", cid, debit=market),
+                         leg("2010", cid, credit=customer),
+                         leg("4100", cid, credit=spread)])
+
+    # -- corrections: reversals (Phase 8) ----------------------------------
+    def on_reversal(self, p: dict, ev: dict) -> list[dict]:
+        """Post the exact inverse of the original event's legs (swap debit and
+        credit) and keep both, then undo the original's effect on the lot book.
+        Reversal of an event never received (or one that posted nothing) is
+        refused; the hold is NOT restored -- a released hold stays released.
+        """
+        orig = p["reverses_event_id"]
+        if orig not in self.legs_by_id:
+            raise Rejected("reversal of an event never posted")
+        if orig in self.reversed:
+            raise Rejected("event already reversed")       # confirm on practice §14
+        self.reversed.add(orig)
+        self._reverse_lots(orig)
+        return [leg(l["account"], l["customer_id"],
+                    debit=l["credit"], credit=l["debit"])
+                for l in self.legs_by_id[orig]]
+
+    def _reverse_lots(self, orig: str) -> None:
+        """Undo the lot-book effect the original event had (§9). No-op for events
+        that never touched the lot book (cash, dividend_cash, fx, placements).
+        """
+        undo = self.lot_undo.get(orig)
+        if undo is None:
+            return
+        kind = undo[0]
+        if kind == "add_lot":                  # buy fill / reinvest: drop the lot
+            _, key, lot = undo
+            lots = self.lots.get(key)
+            if lots and lot in lots:
+                lots.remove(lot)
+        elif kind == "sell":                   # restore the exact lots consumed
+            _, key, slices = undo
+            self._restore_consumed(key, slices)
+        elif kind == "split":                  # scale quantities back
+            _, key, rf, rt = undo
+            for l in self.lots.get(key, []):
+                l.qty = qty6(l.qty * rf / rt)
+        elif kind == "rename":                 # move the renamed lots back
+            _, cid, old, new, moved = undo
+            newlots = self.lots.get((cid, new), [])
+            moved_set = set(id(l) for l in moved)
+            stay = [l for l in newlots if id(l) not in moved_set]
+            back = [l for l in newlots if id(l) in moved_set]
+            if stay:
+                self.lots[(cid, new)] = stay
+            else:
+                self.lots.pop((cid, new), None)
+            self.lots[(cid, old)] = sorted(back + self.lots.get((cid, old), []),
+                                           key=lambda l: l.seq)
+
+    def _restore_consumed(self, key, slices) -> None:
+        """Put back the FIFO cost a sell relieved, at the lots' original delivery
+        positions (by seq). A fully emptied lot is recreated; a partially
+        consumed one has its slice added back.
+        """
+        lots = self.lots.setdefault(key, [])
+        by_seq = {l.seq: l for l in lots}
+        for seq, take, cost_take, emptied in slices:
+            if emptied or seq not in by_seq:
+                lot = Lot(take, cost_take, seq)
+                lots.append(lot)
+                by_seq[seq] = lot
+            else:
+                lot = by_seq[seq]
+                lot.qty += take
+                lot.cost += cost_take
+        lots.sort(key=lambda l: l.seq)
+
+    # -- resilience & the systematic-defect hunt (Phase 10) ----------------
+    def _audit(self, etype: str, p: dict) -> None:
+        """Record payload-consistency violations for the defect hunt (§7.8, §10).
+
+        Diagnostic only -- it never rejects; the enumerated bad-data cases have
+        their own rejects in the handlers. The feed contains >=1 class of
+        internally well-formed but wrong events; run practice through
+        tools/replay.py and read these tallies to spot the shared signature,
+        then add a targeted reject. Nothing here fires without practice data.
+        """
+        try:
+            if etype in ("order_filled", "order_partially_filled"):
+                if money(D(p["quantity"]) * D(p["price"])) != money(p["principal"]):
+                    self.stats["audit:principal!=qty*price"] += 1
+                br = p.get("broker")
+                if br in BROKERS and p.get("asset_class") not in BROKERS[br]["classes"]:
+                    self.stats["audit:broker!=asset_class"] += 1
+            elif etype in ("dividend_cash", "dividend_reinvested"):
+                if money(p["net_amount"]) != money(
+                        D(p["gross_amount"]) - D(p["withholding_tax"])):
+                    self.stats["audit:net!=gross-withholding"] += 1
+            elif etype == "fx_deposit":
+                if money(D(p["amount_foreign"]) * D(p["market_rate"])) != money(
+                        p["usd_at_market_rate"]):
+                    self.stats["audit:usd_market!=amount*rate"] += 1
+            elif etype == "interest_credited":
+                if money(p["customer_share"]) > money(p["gross_amount"]):
+                    self.stats["audit:share>gross"] += 1
+        except (KeyError, ValueError, ArithmeticError, TypeError):
+            pass          # missing/odd fields are the handler's own concern
+
+    def reconcile(self) -> dict:
+        """Final-reconciliation checks a correct book guarantees at stream_end
+        (§13): global trial balance zero, no negative position or lot cost, no
+        open order carrying a negative hold. Unsettled trades are reported, not
+        flagged -- some are legitimately still pending.
+        """
+        neg_pos = [k for k, lots in self.lots.items()
+                   if sum((l.qty for l in lots), D(0)) < 0]
+        neg_cost = any(l.cost < 0 for lots in self.lots.values() for l in lots)
+        neg_hold = [oid for oid, o in self.orders.items()
+                    if not o["closed"] and o["remaining_hold"] < 0]
+        return {
+            "trial_balance_zero": money(sum(self.balances.values(), ZERO)) == ZERO,
+            "negative_positions": neg_pos,
+            "negative_lot_cost": neg_cost,
+            "negative_holds": neg_hold,
+            "unsettled_trades": sum(1 for t in self.trades.values()
+                                    if not t["settled"]),
+        }
 
     # -- reporting ----------------------------------------------------------
     def snapshot(self) -> dict:
@@ -602,7 +838,7 @@ def _decimalize(obj):
 # ---------------------------------------------------------------------------
 class Book:
     def __init__(self, dump: str | None = "__env__") -> None:
-        self.current = State()
+        self.current = State(strict=False)   # live: a fault rejects, never stalls
         self.log: list[dict] = []      # first-delivery events, in delivery order
         self.seen: set[str] = set()
 
@@ -652,7 +888,7 @@ class Book:
         """
         if as_of is None:
             return self.current.snapshot()
-        s = State()
+        s = State(strict=False)          # a live checkpoint must not stall either
         for ev in self.log:
             s.apply(ev)
             if ev.get("event_id") == as_of:

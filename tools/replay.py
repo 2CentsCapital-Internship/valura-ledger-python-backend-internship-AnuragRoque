@@ -48,10 +48,10 @@ def main() -> int:
     types = sorted({t for t in stats if ":" not in t})
     print(f"replayed {n} events ({len(book.seen)} unique) from {path}\n")
     print(f"{'event type':<30}{'seen':>7}{'posted':>8}{'reject':>8}"
-          f"{'malf':>7}{'todo':>7}")
+          f"{'err':>7}{'todo':>7}")
     for t in types:
         print(f"{t:<30}{stats[t]:>7}{stats['posted:' + t]:>8}"
-              f"{stats['reject:' + t]:>8}{stats['malformed:' + t]:>7}"
+              f"{stats['reject:' + t]:>8}{stats['error:' + t]:>7}"
               f"{book.todo.get(t, 0):>7}")
 
     todo_total = sum(book.todo.values())
@@ -59,11 +59,28 @@ def main() -> int:
         print(f"\nnot implemented yet ({todo_total} events skipped): "
               + ", ".join(f"{t}={n}" for t, n in sorted(book.todo.items())))
 
-    # Global trial balance: every posting balances, so the debit-positive sum
-    # over all (customer, account) balances must be exactly zero.
-    total = sum(book.current.balances.values(), ZERO)
-    ok = money(total) == ZERO
-    print(f"\nglobal trial balance: {money(total)}  -> {'OK (zero)' if ok else 'NON-ZERO'}")
+    errors = {k: v for k, v in stats.items() if k.startswith("error:")}
+    if errors:
+        print("\nunexpected faults (rejected to keep the run alive): "
+              + ", ".join(f"{k}={v}" for k, v in sorted(errors.items())))
+
+    # Defect hunt: payload-consistency violations. A class that fires
+    # consistently is the systematic defect to reject (plan.md sections 7.8, 10).
+    audit = {k: v for k, v in stats.items() if k.startswith("audit:")}
+    if audit:
+        print("\ndefect-hunt audit (inspect for a systematic class):")
+        for k, v in sorted(audit.items(), key=lambda kv: -kv[1]):
+            print(f"  {k:<34} {v:>5}")
+
+    # Final reconciliation (plan.md section 13).
+    r = book.current.reconcile()
+    print("\nreconciliation:")
+    for k, v in r.items():
+        print(f"  {k:<22} {v}")
+
+    ok = r["trial_balance_zero"] and not r["negative_positions"] \
+        and not r["negative_lot_cost"] and not r["negative_holds"]
+    print(f"\nglobal trial balance zero & no negatives -> {'OK' if ok else 'FAIL'}")
     return 0 if ok else 2
 
 

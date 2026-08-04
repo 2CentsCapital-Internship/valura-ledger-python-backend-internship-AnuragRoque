@@ -61,15 +61,20 @@ class ArenaClient:
             self.pending = body["postings"] + self.pending
             time.sleep(1)
 
-    def checkpoint(self, http: httpx.Client, cp_id: str) -> None:
+    def checkpoint(self, http: httpx.Client, payload: dict) -> None:
         """Snapshot FIRST, send second.
 
         The reply must describe your book as at the checkpoint's place in the
         stream. Taking the snapshot after the network round trip, or from
         another thread while the stream keeps running, reports a later state
         than the one being asked about.
+
+        Some requests carry as_of_event_id and want the book as it stood once
+        that event was processed, not now; pass it through so the book can
+        answer historically instead of with current state.
         """
-        snap = self.book.snapshot()
+        cp_id = payload["checkpoint_id"]
+        snap = self.book.snapshot(payload.get("as_of_event_id"))
         self.flush(http)
         try:
             http.post(f"{self.url}/v1/checkpoint", params={"mode": self.mode},
@@ -122,7 +127,7 @@ class ArenaClient:
                     else:
                         self.cursor = max(self.cursor, ev.get("offset", 0) + 1)
                         if ev["type"] == "checkpoint_request":
-                            self.checkpoint(http, ev["payload"]["checkpoint_id"])
+                            self.checkpoint(http, ev["payload"])
                         else:
                             self.handle(ev)
 
