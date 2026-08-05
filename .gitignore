@@ -6,4 +6,4 @@ venv/
 key.txt
 events.jsonl
 practice_diag.jsonl
-practice_run*.log
+*_run*.log
