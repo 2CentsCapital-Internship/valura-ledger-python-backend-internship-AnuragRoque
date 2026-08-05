@@ -317,6 +317,45 @@ def test_trade_settled_unknown_and_double_reject():
     assert st.apply(_ev("ts2", "trade_settled", trade_id="T1")) == []   # already done
 
 
+# -- Phase 5b: paying accrued payables onward --------------------------------
+def test_payable_settlements_clear_firm_accounts():
+    st = State()
+    _place_buy(st)
+    _fill(st)                                   # accrues 2411/2420/2400/2430
+    # BRK-A P=5000 rate .30 -> bc 4.85, cc 1.00, r 4.00, ps 1.85
+    b1 = st.apply(_ev("bf", "broker_fees_settled", customer_id="C1", broker="BRK-A"))
+    assert _amt(b1, "2411", "debit") == D("4.85") and _amt(b1, "1100", "credit") == D("4.85")
+    c1 = st.apply(_ev("cf", "custodian_fees_settled", customer_id="C1"))
+    assert _amt(c1, "2420", "debit") == D("1.00")
+    r1 = st.apply(_ev("rf", "reg_fees_remitted", customer_id="C1"))
+    assert _amt(r1, "2400", "debit") == D("4.00")
+    p1 = st.apply(_ev("pp", "partner_payout", customer_id="C1"))
+    assert _amt(p1, "2430", "debit") == D("1.85")
+    # every payable is now flat for this customer
+    for acct in ("2411", "2420", "2400", "2430"):
+        assert st.balances.get(("C1", acct), D("0.00")) == D("0.00"), acct
+
+
+def test_settle_payable_with_nothing_outstanding_rejected():
+    st = State()
+    _place_buy(st)
+    _fill(st)
+    st.apply(_ev("pp1", "partner_payout", customer_id="C1"))      # clears 2430
+    # a second payout has nothing accrued -> reject, and no spurious account
+    assert st.apply(_ev("pp2", "partner_payout", customer_id="C1")) == []
+    assert st.apply(_ev("cf0", "custodian_fees_settled", customer_id="NOBODY")) == []
+    assert ("NOBODY", "2420") not in st.balances                  # .get, not [], on reject
+
+
+def test_settlement_amount_audits_accumulated_rounding():
+    # two fills accrue reg fees independently-rounded; the remit pays the sum
+    st = State()
+    _fill(st, oid="Oa", qty="10", price="33.33", principal="333.30", tid="Ta")  # r=bps(333.30,8)=0.27
+    _fill(st, oid="Ob", qty="10", price="77.77", principal="777.70", tid="Tb")  # r=bps(777.70,8)=0.62
+    legs = st.apply(_ev("rr", "reg_fees_remitted", customer_id="C1"))
+    assert _amt(legs, "2400", "debit") == D("0.89")              # 0.27 + 0.62
+
+
 # -- Phase 6: as-of checkpoints ----------------------------------------------
 def test_asof_checkpoint_reflects_history_not_current():
     from book import Book

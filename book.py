@@ -77,11 +77,18 @@ def leg(account: str, customer_id: str, debit=ZERO, credit=ZERO) -> dict:
             "debit": str(money(debit)), "credit": str(money(credit))}
 
 
+# Whether a fill's zero-value legs (e.g. a loss-making fill's zero partner share,
+# ~1/4 of fills) are dropped. Omitting is balance-safe and leaves firm-account
+# balances identical either way; only per-event leg matching differs. The first
+# practice buy fill settles it -- practice returns the worked examples' full legs
+# -- so this is one switch to flip, not a scattered decision. [plan.md section 14]
+OMIT_ZERO_LEGS = True
+
+
 def _nonzero(legs: list[dict]) -> list[dict]:
-    """Drop legs that are 0.00 on both sides. A zero leg carries no balance and
-    no information (a loss-making fill has a zero partner share, ~1/4 of fills);
-    omitting it is balance-safe. [verify on practice -- plan.md section 14.]
-    """
+    """Drop legs that are 0.00 on both sides, per OMIT_ZERO_LEGS."""
+    if not OMIT_ZERO_LEGS:
+        return legs
     return [l for l in legs if l["debit"] != "0.00" or l["credit"] != "0.00"]
 
 
@@ -573,6 +580,37 @@ class State:
         if t["side"] == "buy":
             return [leg("2350", cid, debit=P), leg("1100", cid, credit=P)]
         return [leg("1100", cid, debit=P), leg("1150", cid, credit=P)]
+
+    # -- paying it all onward: discharge accrued payables (Phase 5) ---------
+    def _settle_payable(self, cid: str, account: str) -> list[dict]:
+        """Discharge a payable in full for one customer, out of omnibus cash. The
+        amount is whatever has accrued on that account for them -- never in the
+        payload -- so each settlement audits every per-trade rounding since the
+        last one. Settling an account with nothing outstanding is an error.
+        Dr <payable> accrued / Cr 1100 accrued.
+        """
+        # .get, not [], so probing a customer never creates a spurious 0.00 entry
+        # that would then be reported as an account we posted to.
+        accrued = -self.balances.get((cid, account), ZERO)   # liability: credit-positive
+        if accrued <= ZERO:
+            raise Rejected("settling a payable with nothing outstanding")
+        return [leg(account, cid, debit=accrued), leg("1100", cid, credit=accrued)]
+
+    def on_broker_fees_settled(self, p: dict, ev: dict) -> list[dict]:
+        """Pay that broker's accumulated fees for this customer (241x)."""
+        return self._settle_payable(p["customer_id"], BROKERS[p["broker"]]["payable"])
+
+    def on_custodian_fees_settled(self, p: dict, ev: dict) -> list[dict]:
+        """Pay the custodian's accumulated fees for this customer (2420)."""
+        return self._settle_payable(p["customer_id"], "2420")
+
+    def on_reg_fees_remitted(self, p: dict, ev: dict) -> list[dict]:
+        """Remit the regulatory fees collected for this customer (2400)."""
+        return self._settle_payable(p["customer_id"], "2400")
+
+    def on_partner_payout(self, p: dict, ev: dict) -> list[dict]:
+        """Pay the introducing partner's accumulated share for this customer (2430)."""
+        return self._settle_payable(p["customer_id"], "2430")
 
     # -- corporate actions, per named customer only (Phase 7) --------------
     def on_dividend_cash(self, p: dict, ev: dict) -> list[dict]:
