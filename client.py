@@ -92,6 +92,8 @@ class ArenaClient:
 
     def consume(self, http: httpx.Client, deadline: float) -> None:
         params = {"mode": self.mode, "from": self.cursor}
+        if self.mode != "practice" and self.cursor == 0:
+            params["new"] = "true"
         last_flush = time.time()
         with http.stream("GET", f"{self.url}/v1/stream", params=params,
                          timeout=httpx.Timeout(None, connect=20)) as r:
@@ -163,7 +165,10 @@ def main() -> int:
     ap.add_argument("--key", required=True, help="your API key from the portal")
     ap.add_argument("--mode", default="practice",
                     choices=["practice", "submission", "final"])
-    ap.add_argument("--seconds", type=float, default=1500)
+    ap.add_argument("--seconds", type=float, default=5400,
+                    help="wall-clock cap. Must exceed the stream length or the "
+                         "client exits mid-run: submission ~65min, final ~75min. "
+                         "Practice ends early via stream_end regardless.")
     a = ap.parse_args()
 
     if a.mode != "practice":

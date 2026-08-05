@@ -38,12 +38,19 @@ D = Decimal
 ZERO = D("0.00")
 
 
+class Rejected(Exception):
+    """Raise from a handler for an event you refuse to post on its own merits."""
+
+
 # ---------------------------------------------------------------------------
 # Numeric helpers (the silent score-killers -- see plan.md section 4)
 # ---------------------------------------------------------------------------
 def money(x) -> Decimal:
     """2 dp, half away from zero. Not round(), which is banker's (half-even)."""
-    return D(x).quantize(D("0.01"), rounding=ROUND_HALF_UP)
+    try:
+        return D(x).quantize(D("0.01"), rounding=ROUND_HALF_UP)
+    except Exception:
+        raise Rejected(f"invalid money amount: {x!r}")
 
 
 def bps(principal, n) -> Decimal:
@@ -59,7 +66,10 @@ def qty6(q) -> Decimal:
     """A share quantity to 6 dp, half away from zero. Splits can produce a
     non-terminating ratio; quantities are graded to at most 6 dp.
     """
-    return D(q).quantize(D("0.000001"), rounding=ROUND_HALF_UP)
+    try:
+        return D(q).quantize(D("0.000001"), rounding=ROUND_HALF_UP)
+    except Exception:
+        raise Rejected(f"invalid quantity: {q!r}")
 
 
 def qty_str(q) -> str:
@@ -220,6 +230,9 @@ class State:
         self.withdrawals: dict[str, dict] = {}     # withdrawal_id -> {cid, amount, status}
         self.orders: dict[str, dict] = {}          # order_id -> Order
         self.trades: dict[str, dict] = {}          # trade_id -> {side, principal, ...}
+        self.booked_trades: set[str] = set()       # every trade_id ever booked; a
+        # reversal pops self.trades (so trade_settled rejects) but NOT this set, so a
+        # fill re-delivered after its reversal is still caught as a duplicate defect.
         self.trade_by_fill: dict[str, str] = {}    # fill event_id -> trade_id (reversal)
         self.legs_by_id: dict[str, list[dict]] = {}  # event_id -> legs (reversal source)
         self.lot_undo: dict[str, object] = {}      # event_id -> lot-book undo record
@@ -448,7 +461,7 @@ class State:
         # the same trade re-delivered with a fresh event_id -- so the event_id
         # seen-set misses it, but a trade cannot be booked twice. A duplicate fill
         # would double-count the position, its cost basis, and every fee. Reject it.
-        if p.get("trade_id") in self.trades:
+        if p.get("trade_id") in self.booked_trades:
             self.stats["defect:duplicate_fill"] += 1
             raise Rejected("duplicate fill: trade already booked")
 
@@ -497,6 +510,7 @@ class State:
         self.lot_undo[ev["event_id"]] = ("add_lot", key, lot)   # for reversal (P8)
         self.trades[p["trade_id"]] = {"side": "buy", "principal": P,
                                       "customer_id": cid, "settled": False}
+        self.booked_trades.add(p["trade_id"])
         self.trade_by_fill[ev["event_id"]] = p["trade_id"]
         return legs
 
@@ -562,6 +576,7 @@ class State:
         self.lot_undo[ev["event_id"]] = ("sell", (cid, p["symbol"]), slices)
         self.trades[p["trade_id"]] = {"side": "sell", "principal": P,
                                       "customer_id": cid, "settled": False}
+        self.booked_trades.add(p["trade_id"])
         self.trade_by_fill[ev["event_id"]] = p["trade_id"]
         return legs
 

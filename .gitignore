@@ -4,6 +4,10 @@ __pycache__/
 venv/
 .env
 key.txt
-events.jsonl
-practice_diag.jsonl
-*_run*.log
+
+# event-stream captures and diagnostic dumps (LEDGER_DUMP, tools/practice.py)
+events*.jsonl
+practice_diag*.jsonl
+
+# run logs
+*.log
