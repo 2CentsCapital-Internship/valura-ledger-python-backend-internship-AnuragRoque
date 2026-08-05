@@ -220,6 +220,7 @@ class State:
         self.withdrawals: dict[str, dict] = {}     # withdrawal_id -> {cid, amount, status}
         self.orders: dict[str, dict] = {}          # order_id -> Order
         self.trades: dict[str, dict] = {}          # trade_id -> {side, principal, ...}
+        self.trade_by_fill: dict[str, str] = {}    # fill event_id -> trade_id (reversal)
         self.legs_by_id: dict[str, list[dict]] = {}  # event_id -> legs (reversal source)
         self.lot_undo: dict[str, object] = {}      # event_id -> lot-book undo record
         self.reversed: set[str] = set()            # events already reversed
@@ -430,8 +431,11 @@ class State:
         if o["filled_qty"] >= o["qty"]:
             o["remaining_hold"] = ZERO
         else:
-            released = money(o["hold"] * o["filled_qty"] / o["qty"])
-            o["remaining_hold"] = o["hold"] - released
+            # Remaining hold is the proportional share of the original hold for the
+            # UNFILLED quantity, rounded once. Subtracting a separately-rounded
+            # released amount double-rounds and drifts a cent on a half-cent split.
+            o["remaining_hold"] = money(
+                o["hold"] * (o["qty"] - o["filled_qty"]) / o["qty"])
 
     def on_order_partially_filled(self, p: dict, ev: dict) -> list[dict]:
         return self._fill(p, ev, final=False)
@@ -440,6 +444,14 @@ class State:
         return self._fill(p, ev, final=True)
 
     def _fill(self, p: dict, ev: dict, final: bool) -> list[dict]:
+        # The systematic defect: a fill whose trade_id we have already booked is
+        # the same trade re-delivered with a fresh event_id -- so the event_id
+        # seen-set misses it, but a trade cannot be booked twice. A duplicate fill
+        # would double-count the position, its cost basis, and every fee. Reject it.
+        if p.get("trade_id") in self.trades:
+            self.stats["defect:duplicate_fill"] += 1
+            raise Rejected("duplicate fill: trade already booked")
+
         # Legs first: a sell can reject (oversell), and a rejected event must
         # leave the book -- including the order lifecycle -- exactly as it was.
         legs = self._buy_fill(p, ev) if p["side"] == "buy" else self._sell_fill(p, ev)
@@ -485,6 +497,7 @@ class State:
         self.lot_undo[ev["event_id"]] = ("add_lot", key, lot)   # for reversal (P8)
         self.trades[p["trade_id"]] = {"side": "buy", "principal": P,
                                       "customer_id": cid, "settled": False}
+        self.trade_by_fill[ev["event_id"]] = p["trade_id"]
         return legs
 
     # -- FIFO lot book & sells (Phase 4 -- the biggest lever) --------------
@@ -549,6 +562,7 @@ class State:
         self.lot_undo[ev["event_id"]] = ("sell", (cid, p["symbol"]), slices)
         self.trades[p["trade_id"]] = {"side": "sell", "principal": P,
                                       "customer_id": cid, "settled": False}
+        self.trade_by_fill[ev["event_id"]] = p["trade_id"]
         return legs
 
     def on_order_cancelled(self, p: dict, ev: dict) -> list[dict]:
@@ -674,12 +688,15 @@ class State:
         A customer rate better than market is a negative spread -- bad data, refused.
         """
         cid = p["customer_id"]
-        if D(p["customer_rate"]) > D(p["market_rate"]):
-            raise Rejected("fx negative spread: customer rate better than market")
         market = money(p["usd_at_market_rate"])
         customer = money(p["usd_at_customer_rate"])
-        spread = market - customer
+        spread = market - customer            # the firm's FX spread, earned now
         if spread < ZERO:
+            # The customer was credited MORE USD than the market value: a negative
+            # spread is bad data, not a gift. We key off the USD amounts, not the
+            # rates -- the feed quotes rate as foreign-per-USD (usd = foreign /
+            # rate), so a *lower* customer rate is the better one; the sign of the
+            # spread is the unambiguous test.
             raise Rejected("fx negative spread")
         return _nonzero([leg("1100", cid, debit=market),
                          leg("2010", cid, credit=customer),
@@ -699,6 +716,11 @@ class State:
             raise Rejected("event already reversed")       # confirm on practice §14
         self.reversed.add(orig)
         self._reverse_lots(orig)
+        # A reversed fill's inverse legs already undo its 2350/1150 obligation, so
+        # drop the trade -- a later trade_settled for it must then post nothing.
+        tid = self.trade_by_fill.get(orig)
+        if tid is not None:
+            self.trades.pop(tid, None)
         return [leg(l["account"], l["customer_id"],
                     debit=l["credit"], credit=l["debit"])
                 for l in self.legs_by_id[orig]]
@@ -776,9 +798,10 @@ class State:
                         D(p["gross_amount"]) - D(p["withholding_tax"])):
                     self.stats["audit:net!=gross-withholding"] += 1
             elif etype == "fx_deposit":
-                if money(D(p["amount_foreign"]) * D(p["market_rate"])) != money(
+                # rate is foreign-per-USD: usd = amount_foreign / rate
+                if money(D(p["amount_foreign"]) / D(p["market_rate"])) != money(
                         p["usd_at_market_rate"]):
-                    self.stats["audit:usd_market!=amount*rate"] += 1
+                    self.stats["audit:usd_market!=amount/rate"] += 1
             elif etype == "interest_credited":
                 if money(p["customer_share"]) > money(p["gross_amount"]):
                     self.stats["audit:share>gross"] += 1

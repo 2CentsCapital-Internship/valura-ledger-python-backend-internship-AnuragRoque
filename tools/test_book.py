@@ -194,6 +194,23 @@ def test_fifo_spans_multiple_lots_oldest_first():
     assert len(lots) == 1 and lots[0].qty == D("5") and lots[0].cost == D("150.00")
 
 
+def test_duplicate_fill_defect_rejected():
+    # the systematic defect: a fill re-delivered with a new event_id but the same
+    # trade_id is a duplicate trade -> reject, leaving position/fees untouched.
+    st = State()
+    _place_buy(st)
+    _fill(st, oid="O1", qty="100", principal="5000.00", tid="T1")   # books trade T1
+    pos_before = [(l.qty, l.cost) for l in st.lots[("C1", "ACME")]]
+    # same trade_id T1, fresh event_id (helper uses "f_"+tid, so vary tid arg only)
+    dup = st.apply(_ev("f_T1_again", "order_filled", order_id="O1", customer_id="C1",
+                       side="buy", symbol="ACME", quantity=D("100"), price=D("50"),
+                       principal=D("5000.00"), asset_class="equity", broker="BRK-A",
+                       partner_rate=D("0.30"), trade_id="T1"))
+    assert dup == []                                     # no legs (matches reference)
+    assert [(l.qty, l.cost) for l in st.lots[("C1", "ACME")]] == pos_before  # no double-count
+    assert st.stats["defect:duplicate_fill"] == 1
+
+
 def test_oversell_rejected_with_zero_mutation():
     st = State()
     _fill(st, oid="Ob", sym="ACME", qty="10", price="50", principal="500.00", tid="Tb")
@@ -475,6 +492,18 @@ def test_reversal_of_split_scales_back():
     assert sum(l.qty for l in lots) == D("100") and sum(l.cost for l in lots) == D("5000.00")
 
 
+def test_trade_settled_after_fill_reversal_posts_nothing():
+    # reversing a fill undoes its 2350 obligation; a later trade_settled for that
+    # trade must then produce no legs (the trade no longer exists).
+    st = State()
+    _place_buy(st)
+    _fill(st)                                    # books trade T1, Cr 2350
+    st.apply(_ev("rev1", "reversal", reverses_event_id="f_T1"))   # undoes it
+    assert "T1" not in st.trades
+    legs = st.apply(_ev("ts1", "trade_settled", trade_id="T1"))
+    assert legs == []                            # nothing to settle -> reject
+
+
 def test_reversal_unknown_ref_rejected():
     st = State()
     assert st.apply(_ev("revx", "reversal", reverses_event_id="ghost")) == []
@@ -492,21 +521,24 @@ def test_reversal_of_fill_does_not_restore_hold():
 
 # -- Phase 9: fx_deposit -----------------------------------------------------
 def test_fx_deposit_spread_to_4100():
+    # real convention: rate is foreign-per-USD, so a HIGHER customer rate gives
+    # FEWER usd (worse) and a positive spread -- this is the valid, normal case.
     st = State()
-    legs = st.apply(_ev("fx1", "fx_deposit", customer_id="C1", amount_foreign=D("1000"),
-                        currency="EUR", market_rate=D("1.10"), customer_rate=D("1.08"),
-                        usd_at_market_rate=D("1100.00"), usd_at_customer_rate=D("1080.00")))
-    assert _amt(legs, "1100", "debit") == D("1100.00")
-    assert _amt(legs, "2010", "credit") == D("1080.00")
-    assert _amt(legs, "4100", "credit") == D("20.00")       # firm's FX spread
+    legs = st.apply(_ev("fx1", "fx_deposit", customer_id="C1", amount_foreign=D("8773.07"),
+                        currency="GBP", market_rate=D("10.9658"), customer_rate=D("11.03"),
+                        usd_at_market_rate=D("800.04"), usd_at_customer_rate=D("795.38")))
+    assert _amt(legs, "1100", "debit") == D("800.04")
+    assert _amt(legs, "2010", "credit") == D("795.38")
+    assert _amt(legs, "4100", "credit") == D("4.66")        # firm's FX spread
 
 
 def test_fx_deposit_negative_spread_rejected():
+    # customer credited MORE usd than market value (spread < 0) -> bad data
     st = State()
-    assert st.apply(_ev("fx2", "fx_deposit", customer_id="C1", amount_foreign=D("1000"),
-                        currency="EUR", market_rate=D("1.08"), customer_rate=D("1.10"),
-                        usd_at_market_rate=D("1080.00"),
-                        usd_at_customer_rate=D("1100.00"))) == []
+    assert st.apply(_ev("fx2", "fx_deposit", customer_id="C1", amount_foreign=D("8773.07"),
+                        currency="GBP", market_rate=D("11.03"), customer_rate=D("10.9658"),
+                        usd_at_market_rate=D("795.38"),
+                        usd_at_customer_rate=D("800.04"))) == []
 
 
 # -- Phase 10: resilience & defect audit -------------------------------------
