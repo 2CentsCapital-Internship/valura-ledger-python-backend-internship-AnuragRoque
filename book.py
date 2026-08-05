@@ -444,11 +444,12 @@ class State:
         if o["filled_qty"] >= o["qty"]:
             o["remaining_hold"] = ZERO
         else:
-            # Remaining hold is the proportional share of the original hold for the
-            # UNFILLED quantity, rounded once. Subtracting a separately-rounded
-            # released amount double-rounds and drifts a cent on a half-cent split.
-            o["remaining_hold"] = money(
-                o["hold"] * (o["qty"] - o["filled_qty"]) / o["qty"])
+            # A fill RELEASES a proportional share of the hold (notes2 §holds); the
+            # released amount is what is rounded to the cent, and the remainder is
+            # the hold minus it. Rounding the remainder directly instead drifts a
+            # cent on a half-cent split (was failing cash_hold at practice).
+            released = money(o["hold"] * o["filled_qty"] / o["qty"])
+            o["remaining_hold"] = o["hold"] - released
 
     def on_order_partially_filled(self, p: dict, ev: dict) -> list[dict]:
         return self._fill(p, ev, final=False)
